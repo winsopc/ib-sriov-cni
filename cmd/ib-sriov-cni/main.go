@@ -8,6 +8,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/containernetworking/cni/pkg/skel"
@@ -18,8 +20,11 @@ import (
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/gofrs/flock"
 	"github.com/vishvananda/netlink"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/util/retry"
 
 	"github.com/k8snetworkplumbingwg/ib-sriov-cni/pkg/config"
+	"github.com/k8snetworkplumbingwg/ib-sriov-cni/pkg/connectiondetails"
 	"github.com/k8snetworkplumbingwg/ib-sriov-cni/pkg/sriov"
 	localtypes "github.com/k8snetworkplumbingwg/ib-sriov-cni/pkg/types"
 	"github.com/k8snetworkplumbingwg/ib-sriov-cni/pkg/utils"
@@ -115,6 +120,122 @@ func handleVfioPciDetection(netConf *localtypes.NetConf) error {
 	return nil
 }
 
+// cniArgKVParts is the field count of a CNI_ARGS "KEY=VALUE" entry.
+const cniArgKVParts = 2
+
+// parsePodIdentity extracts K8S_POD_NAMESPACE / K8S_POD_NAME from the
+// semicolon-separated CNI_ARGS string multus passes on every invocation.
+func parsePodIdentity(cniArgs string) (namespace, name string) {
+	for _, kv := range strings.Split(cniArgs, ";") {
+		parts := strings.SplitN(kv, "=", cniArgKVParts)
+		if len(parts) != cniArgKVParts {
+			continue
+		}
+		switch parts[0] {
+		case "K8S_POD_NAMESPACE":
+			namespace = parts[1]
+		case "K8S_POD_NAME":
+			name = parts[1]
+		}
+	}
+	return namespace, name
+}
+
+// publishConnectionDetails reads the PF node GUID and patches the annotation.
+// Skips the expensive GUID read when the annotation already carries a current
+// entry for this interface (CNI ADD retries).
+func publishConnectionDetails(args *skel.CmdArgs, netConf *localtypes.NetConf) error {
+	namespace, name := parsePodIdentity(args.Args)
+	if namespace == "" || name == "" {
+		return fmt.Errorf("pod identity missing from CNI_ARGS")
+	}
+
+	client, err := connectiondetails.NewPodClient(netConf.Kubeconfig)
+	if err != nil {
+		return err
+	}
+	existing, _, _, err := client.GetAnnotation(namespace, name)
+	if err != nil {
+		return err
+	}
+
+	index, err := connectiondetails.IBDeviceIndex(netConf.DeviceID)
+	if err != nil {
+		return fmt.Errorf("failed to determine IB device index for %s: %w", netConf.DeviceID, err)
+	}
+	indexKey := strconv.Itoa(index)
+
+	if connectiondetails.IsCurrent(existing, indexKey) {
+		connectiondetails.Logf(netConf.LogFile, "connection-details current for %s/%s if=%s dev=%s, skipping",
+			namespace, name, args.IfName, netConf.DeviceID)
+		return nil
+	}
+
+	// The vfio-pci<->mlx5_core rebind re-creates RDMA devices, which must not
+	// race a concurrent VF setup's rebind (see lockCNIExecution). Held only for
+	// the read, not across apiserver calls.
+	lock, err := lockCNIExecution()
+	if err != nil {
+		return err
+	}
+	guid, err := connectiondetails.ReadPFNodeGUID(netConf.DeviceID)
+	unlockCNIExecution(lock)
+	if err != nil {
+		return fmt.Errorf("failed to read PF node GUID for %s: %w", netConf.DeviceID, err)
+	}
+
+	// Read-modify-write under optimistic concurrency: a pod with multiple IB
+	// interfaces converges as each ADD appends its GUID; retry on a racing
+	// writer (Conflict 409 / Invalid 422 from the resourceVersion test) so no
+	// entry is dropped. The GUID read above is not repeated.
+	if err := retry.OnError(retry.DefaultRetry, func(err error) bool {
+		return apierrors.IsConflict(err) || apierrors.IsInvalid(err)
+	}, func() error {
+		current, resourceVersion, present, gerr := client.GetAnnotation(namespace, name)
+		if gerr != nil {
+			return gerr
+		}
+		value, merr := connectiondetails.MergeAnnotation(current, indexKey, guid)
+		if merr != nil {
+			return merr
+		}
+		return client.PatchAnnotation(namespace, name, value, resourceVersion, present)
+	}); err != nil {
+		return err
+	}
+	connectiondetails.Logf(netConf.LogFile, "published connection-details for %s/%s if=%s dev=%s index=%d guid=%s",
+		namespace, name, args.IfName, netConf.DeviceID, index, guid)
+	return nil
+}
+
+// maybePublishConnectionDetails publishes observed PCI allocation facts
+// before the readiness gate fails the ADD, so ib-kubernetes can bind only
+// this pod's PFs (multi-VM per node). Best-effort: every outcome only logs,
+// so the caller's gate error stays unchanged either way.
+func maybePublishConnectionDetails(args *skel.CmdArgs, netConf *localtypes.NetConf) {
+	if !netConf.PublishPfGUID || netConf.DeviceID == "" {
+		return
+	}
+	// PF only: in VF mode ib-kubernetes allocates the GUID and delivers
+	// it via cni-args, and a VF must never be rebound for a GUID read.
+	isVF, vfErr := utils.IsVirtualFunction(netConf.DeviceID)
+	switch {
+	case vfErr != nil:
+		connectiondetails.Logf(netConf.LogFile, "skipping connection-details publish: %v", vfErr)
+	case isVF:
+		// VF device: connection-details does not apply.
+	default:
+		if vfioErr := handleVfioPciDetection(netConf); vfioErr != nil {
+			connectiondetails.Logf(netConf.LogFile, "skipping connection-details publish: %v", vfioErr)
+		} else if netConf.VfioPciMode {
+			if pubErr := publishConnectionDetails(args, netConf); pubErr != nil {
+				connectiondetails.Logf(netConf.LogFile, "failed to publish connection-details for %s if=%s: %v",
+					netConf.DeviceID, args.IfName, pubErr)
+			}
+		}
+	}
+}
+
 // Get network config, updated with GUID, device info and network namespace.
 func getNetConfNetns(args *skel.CmdArgs) (*localtypes.NetConf, ns.NetNS, error) {
 	netConf, err := config.LoadConf(args.StdinData)
@@ -123,6 +244,7 @@ func getNetConfNetns(args *skel.CmdArgs) (*localtypes.NetConf, ns.NetNS, error) 
 	}
 
 	if netConf.IBKubernetesEnabled && netConf.Args.CNI[infiniBandAnnotation] != configuredInfiniBand {
+		maybePublishConnectionDetails(args, netConf)
 		return nil, nil, fmt.Errorf(
 			"infiniBand SRIOV-CNI failed, InfiniBand status \"%s\" is not \"%s\" please check mellanox ib-kubernetes",
 			infiniBandAnnotation, configuredInfiniBand)

@@ -127,6 +127,9 @@ var _ = Describe("IB SR-IOV thin entrypoint", func() {
 			// Create source IB SR-IOV binary file with test content
 			testContent := []byte("test-ib-sriov-binary-content")
 			Expect(os.WriteFile(ibSriovBinFile, testContent, 0755)).To(Succeed())
+			// WriteFile's mode is masked by umask; force exact 0755 so the
+			// copied-mode assertion below is deterministic.
+			Expect(os.Chmod(ibSriovBinFile, 0755)).To(Succeed())
 
 			// Test copyBinary
 			err = (&Options{
