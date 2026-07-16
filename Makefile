@@ -4,7 +4,8 @@ PACKAGE=ib-sriov-cni
 BINDIR=$(CURDIR)/bin
 BUILDDIR=$(CURDIR)/build
 BASE=$(CURDIR)
-GOFILES=$(shell find . -name *.go | grep -vE "(_test.go)")
+CNI_GOFILES=$(shell find . -name *.go -path "./cmd/$(PACKAGE)/*" -o -path "./pkg/*" | grep -vE "(_test.go)")
+THIN_ENTRYPOINT_GOFILES=$(shell find . -name *.go -path "./cmd/thin_entrypoint/*" | grep -vE "(_test.go)")
 PKGS=$(or $(PKG),$(shell $(GO) list ./...))
 TESTPKGS = $(shell $(GO) list -f '{{ if or .TestGoFiles .XTestGoFiles }}{{ .ImportPath }}{{ end }}' $(PKGS))
 
@@ -50,11 +51,18 @@ $(BINDIR):
 $(BUILDDIR): ; $(info Creating build directory...)
 	@mkdir -p $@
 
-build: $(BUILDDIR)/$(BINARY_NAME) ; $(info Building $(BINARY_NAME)...) ## Build executable file
+define go-build
+	@cd $(1) && $(GO_BUILD_OPTS) $(GO) build -o $(2) $(GO_TAGS) -ldflags $(LDFLAGS) -v
+endef
+
+build: $(BUILDDIR)/$(BINARY_NAME) $(BUILDDIR)/thin_entrypoint ; $(info Building $(BINARY_NAME) and thin_entrypoint...) ## Build executable files
 	$(info Done!)
 
-$(BUILDDIR)/$(BINARY_NAME): $(GOFILES) | $(BUILDDIR)
-	@cd $(BASE)/cmd/$(PACKAGE) && $(GO_BUILD_OPTS) $(GO) build -o $(BUILDDIR)/$(BINARY_NAME) $(GO_TAGS) -ldflags $(LDFLAGS) -v
+$(BUILDDIR)/$(BINARY_NAME): $(CNI_GOFILES) | $(BUILDDIR) ; $(info  building $(BINARY_NAME)...)
+	$(call go-build,$(BASE)/cmd/$(PACKAGE),$(BUILDDIR)/$(BINARY_NAME))
+
+$(BUILDDIR)/thin_entrypoint: $(THIN_ENTRYPOINT_GOFILES) | $(BUILDDIR) ; $(info  building thin_entrypoint...)
+	$(call go-build,$(BASE)/cmd/thin_entrypoint,$(BUILDDIR)/thin_entrypoint)
 
 # Tools
 
@@ -62,12 +70,12 @@ GOLANGCI_LINT = $(BINDIR)/golangci-lint
 # golangci-lint version should be updated periodically
 # we keep it fixed to avoid it from unexpectedly failing on the project
 # in case of a version bump
-GOLANGCI_LINT_VER = v1.64.8
+GOLANGCI_LINT_VER = v2.7.2
 TIMEOUT = 15
 export GOLANGCI_LINT_CACHE = $(BUILDDIR)/.cache
 
 $(GOLANGCI_LINT): | $(BINDIR) ; $(info  installing golangci-lint...)
-	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_LINT_VER))
+	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VER))
 
 GOVERALLS = $(BINDIR)/goveralls
 $(GOVERALLS): | $(BINDIR) ; $(info  installing goveralls...)
@@ -78,8 +86,15 @@ $(HADOLINT_TOOL): | $(BINDIR) ; $(info  installing hadolint...)
 	$(call wget-install-tool,$(HADOLINT_TOOL),"https://github.com/hadolint/hadolint/releases/download/v2.12.1-beta/hadolint-Linux-x86_64")
 
 SHELLCHECK_TOOL = $(BINDIR)/shellcheck
+SHELLCHECK_VERSION := v0.11.0
+SHELLCHECK_OS := $(shell uname -s | tr A-Z a-z)
+SHELLCHECK_ARCH := $(shell uname -m)
+ifeq ($(SHELLCHECK_ARCH),arm64)
+	SHELLCHECK_ARCH := aarch64
+endif
+SHELLCHECK_URL := https://github.com/koalaman/shellcheck/releases/download/$(SHELLCHECK_VERSION)/shellcheck-$(SHELLCHECK_VERSION).$(SHELLCHECK_OS).$(SHELLCHECK_ARCH).tar.xz
 $(SHELLCHECK_TOOL): | $(BASE) ; $(info  installing shellcheck...)
-	$(call install-shellcheck,$(BINDIR),"https://github.com/koalaman/shellcheck/releases/download/v0.9.0/shellcheck-v0.9.0.linux.x86_64.tar.xz")
+	$(call install-shellcheck,$(BINDIR),$(SHELLCHECK_URL))
 
 # Tests
 
@@ -113,7 +128,7 @@ hadolint: $(HADOLINT_TOOL); $(info  running hadolint...) ## Run hadolint
 
 .PHONY: shellcheck
 shellcheck: $(SHELLCHECK_TOOL); $(info  running shellcheck...) ## Run shellcheck
-	$Q $(SHELLCHECK_TOOL) images/entrypoint.sh
+	$Q $(SHELLCHECK_TOOL) images/*.sh
 
 # Container image
 .PHONY: image
